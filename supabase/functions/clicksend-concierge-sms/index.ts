@@ -361,8 +361,55 @@ type AiConsistencyReviewResult = {
   next_action: NextAction;
 };
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
+type LifecycleInputSnapshot = {
+  message: string;
+  provider: string | null;
+  fromPhone: string | null;
+  toPhone: string | null;
+};
+
+type LifecycleInterpretationSnapshot = {
+  detectedAction: unknown;
+  internalNotes: string | null;
+};
+
+type LifecycleStateSnapshot<TState> = {
+  before: TState;
+  after: TState;
+};
+
+type LifecycleDecisionSnapshot = {
+  nextAction: string | null;
+  blockers: string[];
+  readyToSearchAvailability: boolean;
+  readyToBook: boolean;
+  needsServiceDecision: boolean;
+  decisionQuestionKey: string | null;
+};
+
+type LifecycleResponseSnapshot = {
+  reply: string | null;
+  internalNotes: string | null;
+};
+
+type LifecycleTrace<TState> = {
+  input: LifecycleInputSnapshot;
+  interpretation: LifecycleInterpretationSnapshot;
+  state: LifecycleStateSnapshot<TState>;
+  decision: LifecycleDecisionSnapshot;
+  response: LifecycleResponseSnapshot;
+};
+
+const SUPABASE_URL =
+  Deno.env.get("SUPABASE_URL") ||
+  Deno.env.get("PROJECT_SUPABASE_URL") ||
+  Deno.env.get("APP_SUPABASE_URL") ||
+  "";
+const SUPABASE_SERVICE_ROLE_KEY =
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ||
+  Deno.env.get("PROJECT_SUPABASE_SERVICE_ROLE_KEY") ||
+  Deno.env.get("APP_SUPABASE_SERVICE_ROLE_KEY") ||
+  "";
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") || "";
 const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") || "gpt-4.1-mini";
 const OPENAI_URL = Deno.env.get("OPENAI_URL") || "https://api.openai.com/v1/chat/completions";
@@ -469,6 +516,74 @@ function uniqueStrings(values: string[]) {
     output.push(clean);
   }
   return output;
+}
+
+function deriveLifecycleDecisionSnapshot(state: {
+  missing_required_info?: string[];
+  ready_to_search_availability?: boolean;
+  ready_to_book?: boolean;
+  needs_service_decision?: boolean;
+  decision_question_key?: string | null;
+}, nextAction: unknown): LifecycleDecisionSnapshot {
+  const blockers = uniqueStrings(
+    Array.isArray(state.missing_required_info)
+      ? state.missing_required_info.map((item) => normalizeString(item))
+      : [],
+  );
+
+  if (state.needs_service_decision && normalizeString(state.decision_question_key)) {
+    blockers.unshift(`decision:${normalizeLowerString(state.decision_question_key)}`);
+  }
+
+  return {
+    nextAction: normalizeString(nextAction) || null,
+    blockers: uniqueStrings(blockers),
+    readyToSearchAvailability: state.ready_to_search_availability === true,
+    readyToBook: state.ready_to_book === true,
+    needsServiceDecision: state.needs_service_decision === true,
+    decisionQuestionKey: normalizeString(state.decision_question_key) || null,
+  };
+}
+
+function buildLifecycleTrace<TState>(input: {
+  message: string;
+  provider?: string | null;
+  fromPhone?: string | null;
+  toPhone?: string | null;
+  detectedAction?: unknown;
+  stateBefore: TState;
+  stateAfter: TState & {
+    missing_required_info?: string[];
+    ready_to_search_availability?: boolean;
+    ready_to_book?: boolean;
+    needs_service_decision?: boolean;
+    decision_question_key?: string | null;
+  };
+  nextAction?: unknown;
+  reply?: string | null;
+  internalNotes?: string | null;
+}): LifecycleTrace<TState> {
+  return {
+    input: {
+      message: normalizeString(input.message),
+      provider: normalizeString(input.provider) || null,
+      fromPhone: normalizeString(input.fromPhone) || null,
+      toPhone: normalizeString(input.toPhone) || null,
+    },
+    interpretation: {
+      detectedAction: input.detectedAction ?? null,
+      internalNotes: normalizeString(input.internalNotes) || null,
+    },
+    state: {
+      before: input.stateBefore,
+      after: input.stateAfter,
+    },
+    decision: deriveLifecycleDecisionSnapshot(input.stateAfter, input.nextAction),
+    response: {
+      reply: normalizeString(input.reply) || null,
+      internalNotes: normalizeString(input.internalNotes) || null,
+    },
+  };
 }
 
 function buildAppointmentManageUrl(publicToken: string) {
@@ -1015,17 +1130,28 @@ const CURATED_SERVICE_RULES: CuratedServiceRule[] = [
   },
   {
     canonical_label: "Face Frame",
-    matches: ["face frame", "money piece", "around my face"],
+    matches: [
+      "face frame",
+      "money piece",
+      "around my face",
+      "brighten up the front",
+      "brighten the front",
+      "lighter in the front",
+      "just the front",
+      "front pieces",
+      "brighter around my face",
+      "face-framing",
+    ],
     preferred_service_names: ["Face Frame Dimensional Color Service"],
   },
   {
     canonical_label: "Partial Highlight",
-    matches: ["partial highlight", "partial highlights", "top + face", "top and face", "crown and face"],
+    matches: ["partial highlight", "partial highlights", "top + face", "top and face", "crown and face", "lighter on top"],
     preferred_service_names: ["Partial Dimensional Color Service"],
   },
   {
     canonical_label: "Full Highlight",
-    matches: ["full highlight", "full highlights", "full head", "top + face + lengths", "through the lengths", "all over blonde", "all over bright"],
+    matches: ["full highlight", "full highlights", "full head", "top + face + lengths", "through the lengths", "all over blonde", "all over bright", "lighter all over", "bright all over"],
     preferred_service_names: ["Full Head Dimensional Color Service"],
   },
   {
@@ -1251,6 +1377,71 @@ function detectServiceChangeMode(message: string): ServiceChangeMode {
   return "none";
 }
 
+function hasExplicitAllOverColorIntent(message: string) {
+  const lower = normalizeLowerString(message);
+  if (!lower) return false;
+  return (
+    /\ball over color\b/.test(lower) ||
+    /\ball[- ]over color\b/.test(lower) ||
+    /\bfull color\b/.test(lower) ||
+    /\brefresh all of it\b/.test(lower) ||
+    /\ball over refresh\b/.test(lower) ||
+    /\ball[- ]over refresh\b/.test(lower) ||
+    /\bbase refresh\b/.test(lower) ||
+    /\bsingle process\b/.test(lower) ||
+    /\bdarker all over\b/.test(lower) ||
+    /\bricher all over\b/.test(lower)
+  );
+}
+
+function hasExplicitRootsOnlyIntent(message: string) {
+  const lower = normalizeLowerString(message).replace(/[’]/g, "'");
+  if (!lower) return false;
+  return (
+    /\broots? only\b/.test(lower) ||
+    /\bjust roots?\b/.test(lower) ||
+    /\bgray coverage\b/.test(lower) ||
+    /\bcover (my )?gray\b/.test(lower) ||
+    /\broot touch[- ]?up\b/.test(lower) ||
+    /\broots?\b/.test(lower)
+  );
+}
+
+function hasExplicitServiceMutationLanguage(message: string) {
+  const lower = normalizeLowerString(message);
+  if (!lower) return false;
+  if (!detectServices(message).length) return false;
+  return detectServiceChangeMode(message) !== "none";
+}
+
+function isExplicitTimingPivotPhrase(message: string) {
+  const lower = normalizeLowerString(message);
+  if (!lower) return false;
+  return (
+    /\bwhat about\b/.test(lower) ||
+    /\bworks better\b/.test(lower) ||
+    /\bcan we do\b/.test(lower) ||
+    /\bafter work instead\b/.test(lower) ||
+    /\bmorning instead\b/.test(lower) ||
+    /\blater that day\b/.test(lower) ||
+    /\bnext week\b/.test(lower) ||
+    /\bnext tuesday\b/.test(lower) ||
+    /\bnext thursday\b/.test(lower) ||
+    /\bfriday instead\b/.test(lower) ||
+    /\bthursday instead\b/.test(lower) ||
+    /\binstead\b/.test(lower)
+  );
+}
+
+function isPureTimingPivotMessage(message: string) {
+  const timing = detectTimingPreference(message);
+  const hasTiming = hasUsableTimingPreference(timing) || isTimingPivotReplacement(timing) || isExplicitTimingPivotPhrase(message);
+  if (!hasTiming) return false;
+  if (detectServices(message).length) return false;
+  if (hasExplicitServiceMutationLanguage(message)) return false;
+  return true;
+}
+
 function isGenericBookingOpenerWithoutService(message: string) {
   const lower = normalizeLowerString(message);
   if (!lower) return false;
@@ -1270,8 +1461,11 @@ function detectNegatedServiceLabels(message: string) {
   const negated = new Set<string>();
   for (const clause of clauses) {
     const lower = normalizeLowerString(clause);
-    if (!/\b(?:no|not for|not a|without)\b/.test(lower)) continue;
-    for (const service of detectServices(clause)) {
+    const negationMatch = lower.match(/\b(?:no|not for|not a|without|skip|remove|drop)\b/);
+    if (!negationMatch || negationMatch.index == null) continue;
+    const negatedFragment = clause.slice(negationMatch.index + negationMatch[0].length).trim();
+    const source = negatedFragment || clause;
+    for (const service of detectServices(source)) {
       const label = canonicalizeRequestedServiceLabel(normalizeString(service.label));
       if (label) negated.add(normalizeLowerString(label));
     }
@@ -1382,15 +1576,19 @@ function resolveNegatedServiceLabelsAgainstCurrentStack(
   for (const clause of clauses) {
     const lower = normalizeLowerString(clause);
     if (!/\b(?:no|not for|not a|without|skip|remove)\b/.test(lower)) continue;
+    const explicitlyNegated = detectNegatedServiceLabels(clause);
+    if (explicitlyNegated.size) {
+      for (const label of explicitlyNegated) {
+        negated.add(normalizeLowerString(label));
+      }
+      continue;
+    }
     const matched = resolveServiceMentionsAgainstCurrentStack(clause, state);
     if (matched.length) {
       for (const service of matched) {
         negated.add(normalizeLowerString(service.label));
       }
       continue;
-    }
-    for (const label of detectNegatedServiceLabels(clause)) {
-      negated.add(normalizeLowerString(label));
     }
   }
   return negated;
@@ -1452,6 +1650,15 @@ function detectServices(message: string) {
 
   for (const source of sources) {
     const clauseStylist = extractStylistMention(source);
+    const curatedMatches = detectCuratedServices(source);
+    for (const match of curatedMatches) {
+      results.push({
+        label: canonicalizeRequestedServiceLabel(match),
+        family: familyKeyForRequestedLabel(match) || "color",
+        confidence: SPECIFIC_SERVICE_LABELS.has(normalizeLowerString(match)) ? 0.88 : 0.72,
+        notes: clauseStylist && clauseStylist !== "any" ? `with ${clauseStylist}` : null,
+      });
+    }
     for (const definition of SERVICE_PATTERNS) {
       if (definition.patterns.some((pattern) => pattern.test(source))) {
         results.push({
@@ -1464,6 +1671,24 @@ function detectServices(message: string) {
     }
   }
   return mergeRequestedServices([], results);
+}
+
+function detectCuratedServices(message: string) {
+  const lower = normalizeLowerString(message);
+  if (!lower) return [];
+
+  const matched = CURATED_SERVICE_RULES
+    .filter((rule) =>
+      rule.matches.some((phrase) => {
+        const normalizedPhrase = normalizeLowerString(phrase);
+        if (!normalizedPhrase) return false;
+        if (normalizedPhrase.includes(" ")) return lower.includes(normalizedPhrase);
+        return new RegExp(`\\b${escapeRegExp(normalizedPhrase)}\\b`, "i").test(lower);
+      })
+    )
+    .map((rule) => rule.canonical_label);
+
+  return uniqueStrings(matched);
 }
 
 function hasSpecificServiceDetails(services: RequestedService[], stack: string[]) {
@@ -2793,14 +3018,14 @@ function bookingReducer(
     }
     case "set_timing":
       if (!hasUsableTimingPreference(input.parsedLatestTiming)) return null;
-      next.timing_preference = input.parsedLatestTiming;
+      next.timing_preference = mergeTimingPreference(state.timing_preference, input.parsedLatestTiming);
       break;
     case "ask_availability":
       break;
     case "widen_timing":
       if (!input.lastOutboundWasNoAvailability) return null;
       next.timing_preference = hasUsableTimingPreference(input.parsedLatestTiming)
-        ? input.parsedLatestTiming
+        ? mergeTimingPreference(state.timing_preference, input.parsedLatestTiming)
         : clearRestrictiveTimingPreference(state.timing_preference);
       break;
     case "check_anyone":
@@ -2813,7 +3038,7 @@ function bookingReducer(
       next.stylist_preference = normalizeString(actionResult.entities.staff) ||
         (normalizeLowerString(state.stylist_preference) !== "any" ? normalizeString(state.stylist_preference) : null);
       next.timing_preference = hasUsableTimingPreference(input.parsedLatestTiming)
-        ? input.parsedLatestTiming
+        ? mergeTimingPreference(state.timing_preference, input.parsedLatestTiming)
         : createAsapTimingPreference("next available");
       break;
     case "do_both":
@@ -2821,7 +3046,7 @@ function bookingReducer(
       next.stylist_preference = "any";
       next.requested_services = clearServiceSpecificStaffNotes(next.requested_services);
       next.timing_preference = hasUsableTimingPreference(input.parsedLatestTiming)
-        ? input.parsedLatestTiming
+        ? mergeTimingPreference(state.timing_preference, input.parsedLatestTiming)
         : createAsapTimingPreference("next available");
       break;
     case "reject_slots":
@@ -2918,6 +3143,25 @@ function collectBookingStateInvariantErrors(input: {
     errors.push("decision_question_key must be null when needs_service_decision is false");
   }
 
+  if (!normalizeString(state.decision_question_key) && state.needs_service_decision) {
+    errors.push("needs_service_decision must be false when decision_question_key is null");
+  }
+
+  if (
+    hasResolvedGrayCoverageRootsAnswer(state) &&
+    missing.some((item) => ["gray_coverage_vs_color_change", "root_only_vs_all_over"].includes(normalizeLowerString(item)))
+  ) {
+    errors.push("resolved gray coverage answer still has stale ambiguity blockers");
+  }
+
+  if (
+    uniqueServiceStack.includes("Root touch-up") &&
+    uniqueServiceStack.includes("Single Process") &&
+    !state.known_constraints.some((item) => normalizeLowerString(item) === "all_over_refresh_confirmed")
+  ) {
+    errors.push("root touch-up confirmation cannot automatically coexist with single process");
+  }
+
   if (missing.length !== uniqueStrings(missing).length) {
     errors.push("missing_required_info contains duplicate labels");
   }
@@ -2988,8 +3232,34 @@ function assertedBookingState(
   state: StructuredBookingState,
   bookingRequest?: BookingRequestDraft | null,
 ) {
-  assertBookingState({ state, bookingRequest });
-  return state;
+  const normalizedState: StructuredBookingState = {
+    ...state,
+    requested_services: state.requested_services.map((item) => ({ ...item })),
+    service_stack: state.service_stack.slice(),
+    known_constraints: state.known_constraints.slice(),
+    missing_required_info: state.missing_required_info.slice(),
+    decision_answer: state.decision_answer ? { ...state.decision_answer } : null,
+  };
+
+  if (!normalizedState.needs_service_decision && normalizeString(normalizedState.decision_question_key)) {
+    normalizedState.decision_question_key = null;
+  }
+
+  if (normalizedState.needs_service_decision && !normalizeString(normalizedState.decision_question_key)) {
+    const inferredKey = decisionQuestionKeyForStateFamily(
+      normalizedState,
+      normalizeLowerString(normalizedState.service_family || "") || null,
+    );
+    if (inferredKey && !normalizeString(normalizedState.service_candidate)) {
+      normalizedState.decision_question_key = inferredKey;
+    } else {
+      normalizedState.needs_service_decision = false;
+      normalizedState.decision_question_key = null;
+    }
+  }
+
+  assertBookingState({ state: normalizedState, bookingRequest });
+  return normalizedState;
 }
 
 function normalizeBookingActionState(input: {
@@ -3162,9 +3432,17 @@ async function tryHandleBookingAction(input: {
     ? []
     : actionResult.action === "remove_service"
     ? (
-      stackMatchedServices.length
-        ? stackMatchedServices
-        : removeServices.map((label) => buildRequestedServiceFromLabel(label, currentState.requested_services))
+      removeServices.length
+        ? removeServices.map((label) => buildRequestedServiceFromLabel(label, currentState.requested_services))
+          .filter((service): service is RequestedService => !!service)
+        : normalizeString(actionResult.entities.service)
+        ? [buildRequestedServiceFromLabel(normalizeString(actionResult.entities.service), currentState.requested_services)]
+          .filter((service): service is RequestedService => !!service)
+        : stackMatchedServices.filter((service) =>
+          negatedServiceLabels.has(
+            normalizeLowerString(canonicalizeRequestedServiceLabel(normalizeString(service.label))),
+          )
+        )
           .filter((service): service is RequestedService => !!service)
     )
     : (
@@ -3258,7 +3536,35 @@ async function tryHandleBookingAction(input: {
     state: invariantState,
     latestInboundText: input.inbound.body,
   });
+  nextState = applyPureTimingPivotProtection(currentState, nextState, input.inbound.body);
+  nextState = applyExplicitGrayCoverageConfirmation(nextState, input.inbound.body);
   nextState = normalizeDecisionStateConsistency(nextState);
+
+  if (
+    !nextState.requested_services.length &&
+    !nextState.service_stack.length &&
+    positiveDetectedServices.length > 0 &&
+    negatedServiceLabels.size > 0
+  ) {
+    const rescuedServices = mergeRequestedServices(
+      [],
+      positiveDetectedServices.map((service) => ({
+        ...service,
+        label: canonicalizeRequestedServiceLabel(normalizeString(service.label)),
+      })).filter((service) => normalizeString(service.label)),
+    );
+    if (rescuedServices.length) {
+      nextState = finalizeAppointmentState({
+        ...nextState,
+        requested_services: rescuedServices,
+        service_stack: normalizeServiceStack(
+          rescuedServices.map((service) => canonicalizeRequestedServiceLabel(normalizeString(service.label))),
+          rescuedServices,
+        ),
+        service_modifiers: [],
+      });
+    }
+  }
 
   let nextBookingRequest = await rebuildBookingRequestForState(nextState);
   nextState = syncStrictAvailabilityReadiness(nextState, nextBookingRequest);
@@ -3352,6 +3658,22 @@ async function tryHandleBookingAction(input: {
   }
 
   if (!canSearchAvailability(nextState, nextBookingRequest)) {
+    const reply = deriveReplyForState(
+      nextState,
+      nextBookingRequest,
+      askAvailabilityReply,
+      "ask_clarifying_question",
+      undefined,
+      normalizeString(input.inbound.body),
+    );
+    const nextAction = deriveNextActionForState(
+      nextState,
+      nextBookingRequest,
+      reply,
+      "ask_clarifying_question",
+      undefined,
+      normalizeString(input.inbound.body),
+    );
     await updateConversationInterpretation(input.conversation.id, buildActionInterpretation({
       state: {
         ...nextState,
@@ -3361,15 +3683,15 @@ async function tryHandleBookingAction(input: {
         ...nextBookingRequest,
         ready_to_search_availability: false,
       },
-      reply: askAvailabilityReply,
-      nextAction: "ask_clarifying_question",
+      reply,
+      nextAction,
       offeredSlots: [],
       internalNotes: `Booking action classifier chose ${actionResult.action}, but search still needs more information.`,
     }));
     return {
       ok: true,
-      reply: askAvailabilityReply,
-      next_action: "ask_clarifying_question" as NextAction,
+      reply,
+      next_action: nextAction,
       offered_slots: [],
     };
   }
@@ -3566,17 +3888,82 @@ function finalizeAiPrimaryState(
     aiState,
     latestInboundText,
   });
+  const protectedState = applyPureTimingPivotProtection(previousState, mergedState, latestInboundText);
+  const clarifiedState = applyExplicitGrayCoverageConfirmation(protectedState, latestInboundText);
   const finalized = finalizeAppointmentState(
     normalizeServiceModifiersForGuidedBooking(
       syncDimensionalPlacementFromStack(
         enforceAiServiceDecisionGuardrails(
-          mergedState,
+          clarifiedState,
           contextText,
         ),
       ),
     ),
   );
   return applyPostNormalizationSemanticGuardrails(previousState, finalized, latestInboundText);
+}
+
+function applyPureTimingPivotProtection(
+  previousState: StructuredBookingState,
+  candidateState: StructuredBookingState,
+  latestInboundText: string,
+) {
+  if (!isPureTimingPivotMessage(latestInboundText)) {
+    return candidateState;
+  }
+
+  const next: StructuredBookingState = {
+    ...candidateState,
+    intent:
+      candidateState.intent === "unclear" && previousState.intent !== "unclear"
+        ? previousState.intent
+        : candidateState.intent,
+    requested_services: previousState.requested_services.map((item) => ({ ...item })),
+    service_stack: previousState.service_stack.slice(),
+    service_family: previousState.service_family,
+    service_family_confidence: previousState.service_family_confidence,
+    service_candidate: previousState.service_candidate,
+    service_candidate_confidence: previousState.service_candidate_confidence,
+    needs_service_decision: previousState.needs_service_decision,
+    decision_question_key: previousState.decision_question_key,
+    decision_answer: previousState.decision_answer ? { ...previousState.decision_answer } : null,
+    service_modifiers: previousState.service_modifiers.slice(),
+    known_constraints: previousState.known_constraints.slice(),
+  };
+
+  if (hasUsableTimingPreference(next.timing_preference)) {
+    next.missing_required_info = next.missing_required_info.filter((item) => normalizeLowerString(item) !== "timing");
+  }
+
+  return normalizeDecisionStateConsistency(assertedBookingState(next));
+}
+
+function applyExplicitGrayCoverageConfirmation(
+  state: StructuredBookingState,
+  latestInboundText: string,
+) {
+  const shouldConfirmRootsOnly =
+    hasExplicitRootsOnlyIntent(latestInboundText) &&
+    (
+      state.decision_question_key === "gray_coverage_scope" ||
+      state.known_constraints.some((item) => normalizeLowerString(item) === "touch_up_ambiguity") ||
+      normalizeLowerString(state.service_family) === "gray_coverage" ||
+      state.service_stack.some((item) => normalizeLowerString(item) === "root touch-up")
+    );
+
+  if (!shouldConfirmRootsOnly) {
+    return state;
+  }
+
+  return normalizeDecisionStateConsistency(applyDecisionAnswer({
+    ...state,
+    decision_question_key: "gray_coverage_scope",
+    needs_service_decision: true,
+    decision_answer: {
+      question_key: "gray_coverage_scope",
+      answer_key: "roots_or_gray",
+    },
+  }));
 }
 
 function isTimingPivotReplacement(next: Partial<TimingPreference> | null | undefined) {
@@ -3594,30 +3981,83 @@ function isTimingPivotReplacement(next: Partial<TimingPreference> | null | undef
   );
 }
 
+function isBroadTimingResetRequest(next: Partial<TimingPreference> | null | undefined) {
+  const raw = normalizeLowerString(next?.raw_text).replace(/[?!.]+$/g, "");
+  if (!raw) return false;
+  return (
+    /\banytime works\b/.test(raw) ||
+    /\bany time works\b/.test(raw) ||
+    /\bopen availability\b/.test(raw) ||
+    /\bno preference\b/.test(raw) ||
+    /\bwhenever\b/.test(raw) ||
+    /\bwhenever works\b/.test(raw) ||
+    /\bwhatever works\b/.test(raw) ||
+    /\bi'?m open anytime\b/.test(raw) ||
+    /\bany day works\b/.test(raw)
+  );
+}
+
 function mergeTimingPreference(previous: TimingPreference, next: Partial<TimingPreference> | null | undefined): TimingPreference {
   const normalizedUrgency = normalizeTimingUrgencyValue(normalizeString(next?.urgency));
   const replaceTiming = isTimingPivotReplacement(next);
+  const broadReset = isBroadTimingResetRequest(next);
   const nextDayPreferences = Array.isArray(next?.day_preferences) ? next.day_preferences.map((value) => normalizeString(value)) : [];
   const nextTimePreferences = Array.isArray(next?.time_preferences) ? next.time_preferences.map((value) => normalizeString(value)) : [];
   const nextRawText = normalizeString(next?.raw_text);
-  const preservePreviousTimeOnly = !!nextRawText && nextDayPreferences.length > 0 && nextTimePreferences.length === 0;
-  return {
-    raw_text: nextRawText || previous.raw_text,
-    date_range: normalizeString(next?.date_range) || previous.date_range,
-    day_preferences: uniqueStrings(replaceTiming ? nextDayPreferences : [
+  const hasIncomingDay = nextDayPreferences.length > 0;
+  const hasIncomingTime = nextTimePreferences.length > 0;
+  const hasIncomingDateRange = !!normalizeString(next?.date_range);
+  const hasIncomingUrgency = !!normalizedUrgency;
+  const isDayOnlyUpdate = hasIncomingDay && !hasIncomingTime && !hasIncomingDateRange && !hasIncomingUrgency;
+  const isTimeOnlyUpdate = hasIncomingTime && !hasIncomingDay && !hasIncomingDateRange && !hasIncomingUrgency;
+  const isCombinedDayTimeUpdate = hasIncomingDay && hasIncomingTime;
+  const shouldReplaceAllTiming = broadReset;
+  const mergedDateRange = shouldReplaceAllTiming
+    ? normalizeString(next?.date_range) || null
+    : hasIncomingDateRange
+    ? normalizeString(next?.date_range)
+    : isDayOnlyUpdate || isTimeOnlyUpdate || isCombinedDayTimeUpdate
+    ? previous.date_range
+    : normalizeString(next?.date_range) || previous.date_range;
+  const mergedUrgency = shouldReplaceAllTiming
+    ? (normalizedUrgency || null)
+    : normalizedUrgency || previous.urgency;
+
+  let mergedDayPreferences: string[] = [];
+  let mergedTimePreferences: string[] = [];
+
+  if (shouldReplaceAllTiming) {
+    mergedDayPreferences = uniqueStrings(nextDayPreferences);
+    mergedTimePreferences = uniqueStrings(nextTimePreferences);
+  } else if (isCombinedDayTimeUpdate) {
+    mergedDayPreferences = uniqueStrings(nextDayPreferences);
+    mergedTimePreferences = uniqueStrings(nextTimePreferences);
+  } else if (isDayOnlyUpdate) {
+    mergedDayPreferences = uniqueStrings(nextDayPreferences);
+    mergedTimePreferences = uniqueStrings(previous.time_preferences);
+  } else if (isTimeOnlyUpdate) {
+    mergedDayPreferences = uniqueStrings(previous.day_preferences);
+    mergedTimePreferences = uniqueStrings(nextTimePreferences);
+  } else if (replaceTiming) {
+    mergedDayPreferences = uniqueStrings(nextDayPreferences.length ? nextDayPreferences : previous.day_preferences);
+    mergedTimePreferences = uniqueStrings(nextTimePreferences.length ? nextTimePreferences : previous.time_preferences);
+  } else {
+    mergedDayPreferences = uniqueStrings([
       ...previous.day_preferences,
       ...nextDayPreferences,
-    ]),
-    time_preferences: uniqueStrings(
-      preservePreviousTimeOnly
-        ? nextTimePreferences
-        : replaceTiming
-        ? nextTimePreferences
-        : [
+    ]);
+    mergedTimePreferences = uniqueStrings([
       ...previous.time_preferences,
       ...nextTimePreferences,
-    ]),
-    urgency: normalizedUrgency || previous.urgency,
+    ]);
+  }
+
+  return {
+    raw_text: nextRawText || previous.raw_text,
+    date_range: mergedDateRange,
+    day_preferences: mergedDayPreferences,
+    time_preferences: mergedTimePreferences,
+    urgency: mergedUrgency,
   };
 }
 
@@ -3661,6 +4101,12 @@ function mergeRequestedServices(previous: RequestedService[], next: RequestedSer
   const hasSpecificHaircut = labels.includes("haircut");
   const hasSpecificBlowout = labels.includes("blowout");
   const hasExtensionsMaintenance = labels.includes("extensions maintenance");
+  const hasRootTouchUp = labels.includes("root touch-up");
+  const hasExplicitSingleProcess =
+    merged.some((item) =>
+      normalizeLowerString(item.label) === "single process" &&
+      normalizeLowerString(item.notes || "").includes("all_over_refresh")
+    );
 
   return merged.filter((item) => {
     const label = normalizeLowerString(item.label);
@@ -3669,6 +4115,7 @@ function mergeRequestedServices(previous: RequestedService[], next: RequestedSer
     if (label === "haircut" && hasSpecificHaircut && item.notes === null) return true;
     if (label === "blowout" && hasSpecificBlowout && item.notes === null) return true;
     if (label === "extensions" && hasExtensionsMaintenance) return false;
+    if (label === "single process" && hasRootTouchUp && !hasExplicitSingleProcess) return false;
     return true;
   });
 }
@@ -3771,6 +4218,8 @@ function applyServiceChangeModeToState(input: {
 }
 
 function mergeAppointmentState(previous: StructuredBookingState, next: Partial<StructuredBookingState>): StructuredBookingState {
+  const hasOwn = (key: keyof StructuredBookingState) =>
+    Object.prototype.hasOwnProperty.call(next, key);
   const requestedServices = mergeRequestedServices(
     previous.requested_services,
     Array.isArray(next.requested_services) ? next.requested_services : [],
@@ -3794,13 +4243,29 @@ function mergeAppointmentState(previous: StructuredBookingState, next: Partial<S
     is_existing_client: typeof next.is_existing_client === "boolean" ? next.is_existing_client : previous.is_existing_client,
     requested_services: requestedServices,
     service_stack: serviceStack,
-    service_family: normalizeString(next.service_family) || previous.service_family,
-    service_family_confidence: normalizeOptionalConfidence(next.service_family_confidence) ?? previous.service_family_confidence,
-    service_candidate: normalizeString(next.service_candidate) || previous.service_candidate,
-    service_candidate_confidence: normalizeOptionalConfidence(next.service_candidate_confidence) ?? previous.service_candidate_confidence,
-    needs_service_decision: typeof next.needs_service_decision === "boolean" ? next.needs_service_decision : previous.needs_service_decision,
-    decision_question_key: (normalizeString(next.decision_question_key) as ServiceDecisionQuestionKey) || previous.decision_question_key,
-    decision_answer: normalizeDecisionAnswer(next.decision_answer) || previous.decision_answer,
+    service_family: hasOwn("service_family")
+      ? normalizeString(next.service_family) || null
+      : previous.service_family,
+    service_family_confidence: hasOwn("service_family_confidence")
+      ? normalizeOptionalConfidence(next.service_family_confidence) ?? null
+      : previous.service_family_confidence,
+    service_candidate: hasOwn("service_candidate")
+      ? normalizeString(next.service_candidate) || null
+      : previous.service_candidate,
+    service_candidate_confidence: hasOwn("service_candidate_confidence")
+      ? normalizeOptionalConfidence(next.service_candidate_confidence) ?? null
+      : previous.service_candidate_confidence,
+    needs_service_decision: hasOwn("needs_service_decision")
+      ? typeof next.needs_service_decision === "boolean"
+        ? next.needs_service_decision
+        : previous.needs_service_decision
+      : previous.needs_service_decision,
+    decision_question_key: hasOwn("decision_question_key")
+      ? ((normalizeString(next.decision_question_key) as ServiceDecisionQuestionKey) || null)
+      : previous.decision_question_key,
+    decision_answer: hasOwn("decision_answer")
+      ? normalizeDecisionAnswer(next.decision_answer)
+      : previous.decision_answer,
     service_modifiers: uniqueStrings([
       ...previous.service_modifiers,
       ...(Array.isArray(next.service_modifiers) ? next.service_modifiers.map((value) => normalizeString(value)) : []),
@@ -3823,8 +4288,27 @@ function mergeAppointmentState(previous: StructuredBookingState, next: Partial<S
   };
 }
 
+function syncRequestedServicesFromServiceStack(state: StructuredBookingState) {
+  if (state.requested_services.length > 0 || state.service_stack.length === 0) {
+    return state;
+  }
+
+  const rebuilt = state.service_stack
+    .map((label) => buildRequestedServiceFromLabel(label, state.requested_services))
+    .filter((service): service is RequestedService => !!service);
+
+  if (!rebuilt.length) {
+    return state;
+  }
+
+  return {
+    ...state,
+    requested_services: mergeRequestedServices([], rebuilt),
+  };
+}
+
 function finalizeAppointmentState(state: StructuredBookingState) {
-  const next = applyDecisionAnswer({
+  const normalizedState = syncRequestedServicesFromServiceStack({
     ...state,
     requested_services: state.requested_services.map((item) => ({ ...item })),
     service_stack: normalizeServiceStack(
@@ -3836,6 +4320,7 @@ function finalizeAppointmentState(state: StructuredBookingState) {
     ),
     stylist_preference: sanitizeStylistPreference(state.stylist_preference, state.requested_services),
   });
+  const next = cleanupResolvedAmbiguities(normalizeDecisionStateConsistency(applyDecisionAnswer(normalizedState)));
   const confidenceTier = inferServiceConfidenceTier(next);
   next.service_family = confidenceTier.service_family;
   next.service_family_confidence = confidenceTier.service_family_confidence;
@@ -3873,6 +4358,12 @@ function finalizeAppointmentState(state: StructuredBookingState) {
   }
 
   next.missing_required_info = normalizeMissingInfoSet(missing.length ? missing : next.missing_required_info);
+  const cleanedNext = cleanupResolvedAmbiguities(next);
+  next.missing_required_info = cleanedNext.missing_required_info.slice();
+  next.known_constraints = cleanedNext.known_constraints.slice();
+  next.needs_service_decision = cleanedNext.needs_service_decision;
+  next.decision_question_key = cleanedNext.decision_question_key;
+  next.decision_answer = cleanedNext.decision_answer ? { ...cleanedNext.decision_answer } : null;
   if (hasTiming) {
     next.missing_required_info = next.missing_required_info.filter((item) => normalizeLowerString(item) !== "timing");
   }
@@ -3880,15 +4371,58 @@ function finalizeAppointmentState(state: StructuredBookingState) {
     next.ready_to_search_availability = false;
   }
 
-  let confidence = next.confidence || 0;
-  if (hasService) confidence += 0.25;
-  if (hasTiming) confidence += 0.25;
-  if (next.stylist_preference) confidence += 0.15;
-  if (next.intent && next.intent !== "unclear") confidence += 0.25;
-  if (next.service_modifiers.length) confidence += 0.1;
-  next.confidence = Math.max(0, Math.min(1, Number(confidence.toFixed(2))));
+  next.confidence = computeStateConfidence(next, {
+    hasService,
+    hasSpecificService,
+    hasTiming,
+  });
 
   return assertedBookingState(next);
+}
+
+function computeStateConfidence(
+  state: StructuredBookingState,
+  input: {
+    hasService?: boolean;
+    hasSpecificService?: boolean;
+    hasTiming?: boolean;
+  } = {},
+) {
+  const hasService = input.hasService ?? (state.requested_services.length > 0 || state.service_stack.length > 0);
+  const hasSpecificService = input.hasSpecificService ?? hasSpecificServiceDetails(state.requested_services, state.service_stack);
+  const hasTiming = input.hasTiming ?? hasUsableTimingPreference(state.timing_preference);
+  const hasStylist = !!normalizeString(state.stylist_preference);
+  const hasIntent = !!state.intent && state.intent !== "unclear";
+  const modifiersCount = state.service_modifiers.length;
+  const missing = new Set(state.missing_required_info.map((item) => normalizeLowerString(item)));
+
+  let confidence = 0.05;
+
+  if (hasIntent) confidence += 0.2;
+  if (hasService) confidence += hasSpecificService ? 0.32 : 0.18;
+  if (hasTiming) confidence += 0.22;
+  if (hasStylist) confidence += 0.08;
+  if (modifiersCount > 0) confidence += Math.min(0.08, modifiersCount * 0.03);
+
+  if (state.service_candidate_confidence != null) {
+    confidence = Math.max(confidence, 0.2 + state.service_candidate_confidence * 0.7);
+  } else if (state.service_family_confidence != null) {
+    confidence = Math.max(confidence, 0.15 + state.service_family_confidence * 0.55);
+  }
+
+  if (missing.has("service_details")) confidence -= 0.18;
+  if (missing.has("service")) confidence -= 0.22;
+  if (missing.has("timing") || missing.has("date")) confidence -= 0.2;
+  if (state.needs_service_decision) confidence -= 0.12;
+
+  if (state.intent === "pricing_question" || state.intent === "general_question") {
+    confidence = Math.max(confidence, hasIntent ? 0.72 : 0.4);
+  }
+  if (state.intent === "cancel" || state.intent === "reschedule") {
+    confidence = Math.max(confidence, hasIntent ? 0.78 : confidence);
+  }
+
+  return Math.max(0, Math.min(1, Number(confidence.toFixed(2))));
 }
 
 function isLowMaintenanceColorFollowupMessage(message: string) {
@@ -4217,9 +4751,19 @@ function inferClientLanguage(service: BoulevardCatalogService) {
   if (name.includes("single process") || name.includes("root touch")) {
     return ["cover my gray", "root touch up", "roots", "base color", "all over color", "touch up"];
   }
-  if (name.includes("face frame")) return ["money piece", "brighter around my face", "face-framing highlights"];
-  if (name.includes("partial highlight")) return ["partial highlights", "lighter on top", "brighten me up", "dimension"];
-  if (name.includes("full highlight")) return ["full highlights", "lighter all over", "go blonde", "brighter throughout"];
+  if (name.includes("face frame")) {
+    return [
+      "money piece",
+      "brighter around my face",
+      "face-framing highlights",
+      "brighten up the front",
+      "lighter in the front",
+      "just the front",
+      "front pieces",
+    ];
+  }
+  if (name.includes("partial highlight")) return ["partial highlights", "lighter on top", "brighten me up", "dimension", "crown and face"];
+  if (name.includes("full highlight")) return ["full highlights", "lighter all over", "go blonde", "brighter throughout", "full head lighter"];
   if (name.includes("balayage")) return ["balayage", "lived in blonde", "soft blonde", "painted highlights"];
   if (name.includes("gloss") || name.includes("glaze") || name.includes("toner")) return ["gloss", "glaze", "toner", "refresh my color", "shine"];
   if (name.includes("haircut")) return ["trim", "cut", "layers", "bangs", "shape", "big change"];
@@ -4753,6 +5297,7 @@ function applyDecisionAnswer(state: StructuredBookingState) {
       );
       next.missing_required_info = next.missing_required_info.filter((item) => normalizeLowerString(item) !== "service_details");
       next.known_constraints = next.known_constraints.filter((item) => normalizeLowerString(item) !== "blonde_refresh_ambiguity");
+      next.needs_service_decision = false;
       next.decision_question_key = null;
       break;
     }
@@ -4775,12 +5320,23 @@ function applyDecisionAnswer(state: StructuredBookingState) {
       next.service_candidate_confidence = Math.max(next.service_candidate_confidence || 0, 0.96);
       next.needs_service_decision = false;
       next.decision_question_key = null;
-      next.decision_answer = null;
+      next.decision_answer = {
+        question_key: decision.question_key,
+        answer_key: decision.answer_key,
+      };
       next.missing_required_info = next.missing_required_info.filter((item) => {
         const lower = normalizeLowerString(item);
         return lower !== "service_details" && lower !== "gray_coverage_scope";
       });
-      next.known_constraints = next.known_constraints.filter((item) => normalizeLowerString(item) !== "touch_up_ambiguity");
+      next.known_constraints = next.known_constraints.filter((item) => {
+        const lower = normalizeLowerString(item);
+        if (lower === "touch_up_ambiguity") return false;
+        if (lower === "all_over_refresh_confirmed" && answer === "roots_or_gray") return false;
+        return true;
+      });
+      if (answer === "all_over_refresh") {
+        next.known_constraints = uniqueStrings([...next.known_constraints, "all_over_refresh_confirmed"]);
+      }
       break;
     }
     case "gloss_vs_brightness": {
@@ -4831,7 +5387,48 @@ function applyDecisionAnswer(state: StructuredBookingState) {
       return assertedBookingState(next);
   }
 
-  next.decision_answer = null;
+  if (decision.question_key !== "gray_coverage_scope") {
+    next.decision_answer = null;
+  }
+  return assertedBookingState(next);
+}
+
+function hasResolvedGrayCoverageRootsAnswer(state: StructuredBookingState) {
+  const answer = state.decision_answer;
+  if (!answer) return false;
+  if (answer.question_key !== "gray_coverage_scope") return false;
+  if (normalizeLowerString(answer.answer_key) !== "roots_or_gray") return false;
+  if (state.needs_service_decision) return false;
+  const stackLabels = state.service_stack.map((item) => normalizeLowerString(item));
+  const requestedLabels = state.requested_services.map((item) => normalizeLowerString(item.label));
+  return stackLabels.includes("root touch-up") || requestedLabels.includes("root touch-up");
+}
+
+function cleanupResolvedAmbiguities(state: StructuredBookingState) {
+  const next: StructuredBookingState = {
+    ...state,
+    requested_services: state.requested_services.map((item) => ({ ...item })),
+    service_stack: state.service_stack.slice(),
+    known_constraints: state.known_constraints.slice(),
+    missing_required_info: state.missing_required_info.slice(),
+    decision_answer: state.decision_answer ? { ...state.decision_answer } : null,
+  };
+
+  if (hasResolvedGrayCoverageRootsAnswer(next)) {
+    next.missing_required_info = normalizeMissingInfoSet(
+      next.missing_required_info.filter((item) => {
+        const lower = normalizeLowerString(item);
+        return lower !== "gray_coverage_scope" &&
+          lower !== "gray_coverage_vs_color_change" &&
+          lower !== "root_only_vs_all_over" &&
+          lower !== "service_details";
+      }),
+    );
+    next.known_constraints = next.known_constraints.filter((item) => normalizeLowerString(item) !== "touch_up_ambiguity");
+    next.needs_service_decision = false;
+    next.decision_question_key = null;
+  }
+
   return assertedBookingState(next);
 }
 
@@ -4846,6 +5443,8 @@ function normalizeDecisionStateConsistency(state: StructuredBookingState) {
   const lowerFamily = normalizeLowerString(next.service_family || "");
   const stackLabels = next.service_stack.map((item) => normalizeLowerString(item));
   const requestedLabels = next.requested_services.map((item) => normalizeLowerString(item.label));
+  const hasRootTouchUp = stackLabels.includes("root touch-up") || requestedLabels.includes("root touch-up");
+  const hasSingleProcess = stackLabels.includes("single process") || requestedLabels.includes("single process");
   const hasSpecificGrayCoverage =
     stackLabels.some((item) => ["root touch-up", "single process"].includes(item)) ||
     requestedLabels.some((item) => ["root touch-up", "single process"].includes(item));
@@ -4875,9 +5474,42 @@ function normalizeDecisionStateConsistency(state: StructuredBookingState) {
     }
   }
 
+  if (hasRootTouchUp && hasSingleProcess && !constraints.has("all_over_refresh_confirmed")) {
+    next.requested_services = next.requested_services.filter((item) => normalizeLowerString(item.label) !== "single process");
+    next.service_stack = normalizeServiceStack(
+      next.service_stack.filter((item) => normalizeLowerString(item) !== "single process"),
+      next.requested_services,
+    );
+    if (normalizeLowerString(next.service_candidate) === "single process") {
+      next.service_candidate = "Root touch-up";
+      next.service_candidate_confidence = next.service_candidate_confidence ?? 0.96;
+    }
+  }
+
+  if (hasRootTouchUp && !constraints.has("all_over_refresh_confirmed")) {
+    next.known_constraints = next.known_constraints.filter((item) => normalizeLowerString(item) !== "all_over_refresh_confirmed");
+  }
+
+  if (
+    hasRootTouchUp &&
+    !constraints.has("all_over_refresh_confirmed") &&
+    next.decision_answer?.question_key === "gray_coverage_scope" &&
+    normalizeLowerString(next.decision_answer.answer_key) === "roots_or_gray"
+  ) {
+    next.needs_service_decision = false;
+    next.decision_question_key = null;
+    next.missing_required_info = next.missing_required_info.filter((item) => {
+      const lower = normalizeLowerString(item);
+      return lower !== "service_details" && lower !== "gray_coverage_scope";
+    });
+    next.known_constraints = next.known_constraints.filter((item) => normalizeLowerString(item) !== "touch_up_ambiguity");
+  }
+
   if (!next.needs_service_decision) {
     next.decision_question_key = null;
-    next.decision_answer = null;
+    if (!hasResolvedGrayCoverageRootsAnswer(next)) {
+      next.decision_answer = null;
+    }
   } else if (!normalizeString(next.decision_question_key)) {
     const inferredKey = decisionQuestionKeyForStateFamily(next, lowerFamily || null);
     if (inferredKey && !normalizeString(next.service_candidate)) {
@@ -4889,7 +5521,7 @@ function normalizeDecisionStateConsistency(state: StructuredBookingState) {
     }
   }
 
-  return assertedBookingState(next);
+  return cleanupResolvedAmbiguities(assertedBookingState(next));
 }
 
 function staffTopicLabelForFamily(family: string) {
@@ -5121,7 +5753,7 @@ function hasDimensionalColorIntent(state: StructuredBookingState, contextText: s
 function inferDimensionalPlacementLabel(contextText: string) {
   const lower = normalizeLowerString(contextText);
   if (!lower) return null;
-  if (/\bface frame\b|\bmoney piece\b|\baround my face\b|\bfront pieces?\b/.test(lower)) {
+  if (/\bface frame\b|\bmoney piece\b|\baround my face\b|\bfront pieces?\b|\bbrighten(?:\s+up)?\s+the\s+front\b|\blighter\s+in\s+the\s+front\b|\bjust\s+the\s+front\b/.test(lower)) {
     return "Face Frame";
   }
   if (/\bpartial highlights?\b|\bpartial highlight\b|\btop\s*(?:\+|and)\s*face\b|\bcrown\b/.test(lower)) {
@@ -5406,8 +6038,9 @@ function enforceAiServiceDecisionGuardrails(state: StructuredBookingState, conte
   const hasSpecificService = hasSpecificServiceDetails(next.requested_services, next.service_stack) || !!normalizeString(next.service_candidate);
   const hasBlowoutCue = /\bblowout\b|\bblow dry\b|\bblowdry\b|\bclassic blowout\b|\bsignature blowout\b/.test(lower);
   const hasHaircutCue = /\bhaircut\b|\btrim\b|\bcut\b|\blayers\b|\breshape\b|\bdusting\b/.test(lower);
+  const inferredDimensionalPlacement = inferDimensionalPlacementLabel(lower);
   const hasExplicitSpecificDimensionalCue =
-    /\bface frame\b|\bmoney piece\b|\bpartial highlights?\b|\bpartial highlight\b|\bfull highlights?\b|\bfull highlight\b/.test(lower);
+    !!inferredDimensionalPlacement;
   const lowMaintenanceColorFollowup =
     next.known_constraints.some((item) => normalizeLowerString(item) === "low_maintenance_goal") &&
     /\bcolor\b/.test(lower) &&
@@ -5553,11 +6186,7 @@ function enforceAiServiceDecisionGuardrails(state: StructuredBookingState, conte
   }
 
   if (hasExplicitSpecificDimensionalCue) {
-    const specificLabel =
-      /\bface frame\b|\bmoney piece\b/.test(lower) ? "Face Frame"
-      : /\bpartial highlights?\b|\bpartial highlight\b/.test(lower) ? "Partial Highlight"
-      : /\bfull highlights?\b|\bfull highlight\b/.test(lower) ? "Full Highlight"
-      : null;
+    const specificLabel = inferredDimensionalPlacement;
     if (specificLabel) {
       const confidence = /\bmaybe\b/.test(lower) ? 0.72 : 0.95;
       next.requested_services = mergeRequestedServices(
@@ -6190,6 +6819,17 @@ function deriveNextActionForState(
   return planNextReplyDecision(state, bookingRequest, preferredReply, preferredNextAction, bookingKnowledge, sourceText).nextAction;
 }
 
+function isTimingClarificationReply(reply: string) {
+  const lower = normalizeLowerString(reply);
+  if (!lower) return false;
+  return (
+    lower.includes("what day or time works best") ||
+    lower.includes("day or general window") ||
+    lower.includes("mornings, afternoons, evenings") ||
+    lower.includes("what timing do you need")
+  );
+}
+
 function normalizeAnswerQuestionState(state: StructuredBookingState) {
   return {
     ...state,
@@ -6251,6 +6891,9 @@ function detectSimulationInconsistencies(input: {
   stateBefore: StructuredBookingState;
   stateAfter: StructuredBookingState;
   bookingRequestAfter: BookingRequestDraft;
+  latestMessage?: string;
+  reply?: string;
+  nextAction?: string | null;
 }) {
   const errors = collectBookingStateInvariantErrors({
     state: input.stateAfter,
@@ -6295,6 +6938,40 @@ function detectSimulationInconsistencies(input: {
     input.stateAfter.ready_to_search_availability
   ) {
     errors.push("booking state is search-ready without timing");
+  }
+
+  if (isPureTimingPivotMessage(normalizeString(input.latestMessage))) {
+    const beforeServices = uniqueStrings(
+      input.stateBefore.service_stack.map((value) => canonicalizeRequestedServiceLabel(normalizeString(value))).filter(Boolean),
+    );
+    const afterServices = uniqueStrings(
+      input.stateAfter.service_stack.map((value) => canonicalizeRequestedServiceLabel(normalizeString(value))).filter(Boolean),
+    );
+    if (beforeServices.join("|") !== afterServices.join("|")) {
+      errors.push("pure timing pivot modified services");
+    }
+
+    const beforeTiming = input.stateBefore.timing_preference;
+    const afterTiming = input.stateAfter.timing_preference;
+    const incomingTiming = detectTimingPreference(normalizeString(input.latestMessage));
+    const incomingHasDayOnly = incomingTiming.day_preferences.length > 0 && incomingTiming.time_preferences.length === 0;
+    const beforeHasTime = beforeTiming.time_preferences.length > 0;
+    const afterLostTime = afterTiming.time_preferences.length === 0;
+    if (incomingHasDayOnly && beforeHasTime && afterLostTime) {
+      errors.push("day-only timing pivot dropped an existing time preference");
+    }
+  }
+
+  if (
+    input.stateAfter.intent === "book" &&
+    hasService &&
+    hasTiming &&
+    !missing.includes("service") &&
+    !missing.includes("service_details") &&
+    !missing.includes("timing") &&
+    isTimingClarificationReply(normalizeString(input.reply))
+  ) {
+    errors.push("service and timing are resolved but the reply still asks for timing");
   }
 
   return errors;
@@ -6563,7 +7240,7 @@ function buildBookingActionClassifierSchema() {
               items: { type: "string" },
             },
           },
-          required: ["service", "staff", "timing", "exclude_staff"],
+          required: ["service", "staff", "timing", "selection", "exclude_staff"],
         },
       },
       required: ["action", "confidence", "entities"],
@@ -7560,6 +8237,15 @@ async function tryHandleAppointmentLookup(input: {
 }) {
   const intent = detectAppointmentLookupIntent(input.inbound.body);
   if (!intent) return null;
+  const currentState = mergeAppointmentState(
+    createEmptyState(input.inbound.fromPhone),
+    safeObject(input.conversation.state) as unknown as Partial<StructuredBookingState>,
+  );
+  const nextIntent = intent === "cancel"
+    ? "cancel"
+    : intent === "reschedule"
+    ? "reschedule"
+    : "general_question";
 
   const appointments = await fetchUpcomingAppointmentsByPhone(input.inbound.fromPhone).catch((error) => {
     console.error("Failed to fetch upcoming appointments", error);
@@ -7567,13 +8253,27 @@ async function tryHandleAppointmentLookup(input: {
   });
 
   if (!appointments.length) {
+    const nextState: StructuredBookingState = {
+      ...currentState,
+      intent: nextIntent,
+      client_facing_reply: "I’m not seeing any upcoming appointments tied to this number right now. If you used a different number for booking, send it here and I can check again.",
+    };
+    const nextBookingRequest = buildBookingRequestDraft(nextState);
+    await updateConversationInterpretation(input.conversation.id, {
+      updatedState: nextState,
+      clientFacingReply: nextState.client_facing_reply,
+      internalNotes: "Handled appointment lookup request with no upcoming appointments found for the phone number.",
+      nextAction: "answer_question",
+      bookingRequest: nextBookingRequest,
+      offeredSlots: [],
+    });
     await updateConversationMetadata(input.conversation.id, {
       appointment_lookup: null,
       next_action: "answer_question",
     });
     return {
       ok: true,
-      reply: "I’m not seeing any upcoming appointments tied to this number right now. If you used a different number for booking, send it here and I can check again.",
+      reply: nextState.client_facing_reply,
       next_action: "answer_question" as NextAction,
     };
   }
@@ -7585,7 +8285,21 @@ async function tryHandleAppointmentLookup(input: {
     ? "I found these upcoming appointments on this number. Reply with the number of the one you want to reschedule, and I’ll send the manage link."
     : "Here are the upcoming appointments I found on this number. Reply with the number of the one you want to manage, and I’ll send the link.";
   const reply = `${intro}\n\n${lines.join("\n")}`;
+  const nextState: StructuredBookingState = {
+    ...currentState,
+    intent: nextIntent,
+    client_facing_reply: reply,
+  };
+  const nextBookingRequest = buildBookingRequestDraft(nextState);
 
+  await updateConversationInterpretation(input.conversation.id, {
+    updatedState: nextState,
+    clientFacingReply: nextState.client_facing_reply,
+    internalNotes: "Handled appointment lookup request and returned a numbered list of matching appointments.",
+    nextAction: "ask_clarifying_question",
+    bookingRequest: nextBookingRequest,
+    offeredSlots: [],
+  });
   await updateConversationMetadata(input.conversation.id, {
     appointment_lookup: {
       requested_action: intent,
@@ -7703,10 +8417,35 @@ function normalizeInboundPayload(body: JsonRecord) {
   } satisfies InboundSmsMessage;
 }
 
-async function handleInboundWebhook(body: JsonRecord) {
+type InboundLifecycleContext = {
+  inbound: InboundSmsMessage;
+  conversation: SmsConversationRecord;
+  recentMessages: SmsMessageRecord[];
+  resetRequested: boolean;
+};
+
+type InboundLifecycleReply = {
+  reply: string;
+  nextAction: string | null;
+  generatedBy: string;
+  responseBody?: JsonRecord;
+  rawPayload?: JsonRecord;
+  ai?: JsonRecord;
+  internalNotes?: string | null;
+  offeredSlots?: AvailabilitySlotSuggestion[];
+  stateSnapshot?: StructuredBookingState | null;
+  bookingRequest?: BookingRequestDraft | null;
+};
+
+type InboundLifecycleDecision =
+  | { kind: "reset" }
+  | { kind: "short_circuit_action" }
+  | { kind: "interpretation" };
+
+async function runInputPhase(body: JsonRecord) {
   const inbound = normalizeInboundPayload(body);
   if (!inbound.fromPhone || !inbound.body) {
-    return buildErrorResponse("Missing sender phone or message body", 400);
+    return { response: buildErrorResponse("Missing sender phone or message body", 400) };
   }
 
   const resetRequested = isConversationResetRequest(inbound.body);
@@ -7738,13 +8477,15 @@ async function handleInboundWebhook(body: JsonRecord) {
         .reverse()
         .find((message) => message.direction === "outbound");
       const metadata = safeObject(conversation.metadata);
-      return buildSuccessResponse({
-        ok: true,
-        duplicate: true,
-        conversation_id: conversation.id,
-        reply: normalizeString(lastOutbound?.body),
-        next_action: normalizeString(metadata.next_action) || null,
-      });
+      return {
+        response: buildSuccessResponse({
+          ok: true,
+          duplicate: true,
+          conversation_id: conversation.id,
+          reply: normalizeString(lastOutbound?.body),
+          next_action: normalizeString(metadata.next_action) || null,
+        }),
+      };
     }
   }
 
@@ -7770,103 +8511,124 @@ async function handleInboundWebhook(body: JsonRecord) {
     },
   });
 
-  if (resetRequested) {
-    const reply = "Starting fresh. What would you like to book or manage today?";
-    await sendAndStoreOutboundReply({
-      conversationId: conversation.id,
-      provider: inbound.provider,
-      fromPhone: inbound.toPhone,
-      toPhone: inbound.fromPhone,
-      body: reply,
-      rawPayload: {
-        generated_by: "sms_concierge_reset",
-        next_action: "ask_clarifying_question",
-      },
-      ai: {
-        next_action: "ask_clarifying_question",
-      },
-    });
+  const recentMessages = await listRecentMessages(conversation.id, 12);
 
-    return buildSuccessResponse({
-      ok: true,
-      conversation_id: conversation.id,
-      reply,
+  return {
+    context: {
+      inbound,
+      conversation,
+      recentMessages,
+      resetRequested,
+    } satisfies InboundLifecycleContext,
+  };
+}
+
+function buildResetLifecycleReply(): InboundLifecycleReply {
+  return {
+    reply: "Starting fresh. What would you like to book or manage today?",
+    nextAction: "ask_clarifying_question",
+    generatedBy: "sms_concierge_reset",
+    ai: {
       next_action: "ask_clarifying_question",
-    });
+    },
+  };
+}
+
+function buildLifecycleReply(input: InboundLifecycleReply): InboundLifecycleReply {
+  return input;
+}
+
+async function respondToInboundLifecycle(
+  context: InboundLifecycleContext,
+  reply: InboundLifecycleReply,
+) {
+  await sendAndStoreOutboundReply({
+    conversationId: context.conversation.id,
+    provider: context.inbound.provider,
+    fromPhone: context.inbound.toPhone,
+    toPhone: context.inbound.fromPhone,
+    body: reply.reply,
+    rawPayload: {
+      generated_by: reply.generatedBy,
+      next_action: reply.nextAction,
+      ...safeObject(reply.rawPayload),
+    },
+    ai: {
+      ...safeObject(reply.ai),
+      ...(reply.nextAction ? { next_action: reply.nextAction } : {}),
+    },
+    stateSnapshot: reply.stateSnapshot || undefined,
+    bookingRequest: reply.bookingRequest || undefined,
+    internalNotes: reply.internalNotes || undefined,
+    offeredSlots: reply.offeredSlots || [],
+  });
+
+  return buildSuccessResponse({
+    ok: true,
+    conversation_id: context.conversation.id,
+    reply: reply.reply,
+    next_action: reply.nextAction,
+    ...(reply.responseBody || {}),
+  });
+}
+
+function runDecisionPhase(context: InboundLifecycleContext): InboundLifecycleDecision {
+  if (context.resetRequested) {
+    return { kind: "reset" };
   }
 
+  // Deterministic slot-selection, appointment-management, and follow-up flows get first pass
+  // before we spend AI tokens or mutate booking state through the interpretation engine.
+  return { kind: "short_circuit_action" };
+}
+
+async function runActionPhase(context: InboundLifecycleContext) {
   const appointmentLookupResult = await tryHandleAppointmentLookup({
-    conversation,
-    inbound,
+    conversation: context.conversation,
+    inbound: context.inbound,
   });
   if (appointmentLookupResult) {
-    await sendAndStoreOutboundReply({
-      conversationId: conversation.id,
-      provider: inbound.provider,
-      fromPhone: inbound.toPhone,
-      toPhone: inbound.fromPhone,
-      body: appointmentLookupResult.reply,
+    return buildLifecycleReply({
+      reply: appointmentLookupResult.reply,
+      nextAction: appointmentLookupResult.next_action,
+      generatedBy: "sms_concierge_appointment_lookup",
       rawPayload: {
-        generated_by: "sms_concierge_appointment_lookup",
-        next_action: appointmentLookupResult.next_action,
         appointments: appointmentLookupResult.appointments || [],
       },
-      ai: {
-        next_action: appointmentLookupResult.next_action,
-      },
       internalNotes: "Looked up upcoming appointments by phone number and sent a numbered appointment list.",
-    });
-
-    return buildSuccessResponse({
-      ok: true,
-      conversation_id: conversation.id,
-      reply: appointmentLookupResult.reply,
-      next_action: appointmentLookupResult.next_action,
-      appointments: appointmentLookupResult.appointments || [],
+      responseBody: {
+        appointments: appointmentLookupResult.appointments || [],
+      },
     });
   }
 
   const selectionResult = await tryHandleOfferedSlotSelection({
-    conversation,
-    inbound,
+    conversation: context.conversation,
+    inbound: context.inbound,
   });
   if (selectionResult) {
-    await sendAndStoreOutboundReply({
-      conversationId: conversation.id,
-      provider: inbound.provider,
-      fromPhone: inbound.toPhone,
-      toPhone: inbound.fromPhone,
-      body: selectionResult.reply,
+    return buildLifecycleReply({
+      reply: selectionResult.reply,
+      nextAction: selectionResult.next_action,
+      generatedBy: "sms_concierge_slot_selection",
       rawPayload: {
-        generated_by: "sms_concierge_slot_selection",
-        next_action: selectionResult.next_action,
         selected_slot: selectionResult.selected_slot,
         payment_session_token: selectionResult.payment_session.token,
         payment_session_url: selectionResult.payment_session_url,
       },
-      ai: {
-        next_action: selectionResult.next_action,
-      },
       internalNotes: "Client selected an offered availability slot and was sent the booking completion link.",
-    });
-
-    return buildSuccessResponse({
-      ok: true,
-      conversation_id: conversation.id,
-      reply: selectionResult.reply,
-      next_action: selectionResult.next_action,
-      payment_session: selectionResult.payment_session,
-      payment_session_url: selectionResult.payment_session_url,
-      selected_slot: selectionResult.selected_slot,
+      responseBody: {
+        payment_session: selectionResult.payment_session,
+        payment_session_url: selectionResult.payment_session_url,
+        selected_slot: selectionResult.selected_slot,
+      },
     });
   }
 
-  const recentMessages = await listRecentMessages(conversation.id, 12);
-
   const appointmentLookupNameReplyResult = await tryHandleAppointmentLookupNameReply({
-    conversation,
-    inbound,
-    recentMessages,
+    conversation: context.conversation,
+    inbound: context.inbound,
+    recentMessages: context.recentMessages,
   });
   if (appointmentLookupNameReplyResult) {
     if (appointmentLookupNameReplyResult.client_name) {
@@ -7876,235 +8638,189 @@ async function handleInboundWebhook(body: JsonRecord) {
           customer_name: appointmentLookupNameReplyResult.client_name,
           last_message_at: new Date().toISOString(),
         })
-        .eq("id", normalizeString(conversation.id));
+        .eq("id", normalizeString(context.conversation.id));
       if (update.error) throw update.error;
     }
-    await sendAndStoreOutboundReply({
-      conversationId: conversation.id,
-      provider: inbound.provider,
-      fromPhone: inbound.toPhone,
-      toPhone: inbound.fromPhone,
-      body: appointmentLookupNameReplyResult.reply,
+    return buildLifecycleReply({
+      reply: appointmentLookupNameReplyResult.reply,
+      nextAction: appointmentLookupNameReplyResult.next_action,
+      generatedBy: "sms_concierge_appointment_lookup_name_reply",
       rawPayload: {
-        generated_by: "sms_concierge_appointment_lookup_name_reply",
-        next_action: appointmentLookupNameReplyResult.next_action,
         appointments: appointmentLookupNameReplyResult.appointments || [],
       },
-      ai: {
-        next_action: appointmentLookupNameReplyResult.next_action,
-      },
       internalNotes: "Recovered an appointment lookup after a name-confirmation prompt and returned the phone-matched appointment list.",
-    });
-
-    return buildSuccessResponse({
-      ok: true,
-      conversation_id: conversation.id,
-      reply: appointmentLookupNameReplyResult.reply,
-      next_action: appointmentLookupNameReplyResult.next_action,
-      appointments: appointmentLookupNameReplyResult.appointments || [],
+      responseBody: {
+        appointments: appointmentLookupNameReplyResult.appointments || [],
+      },
     });
   }
 
   const appointmentSelectionResult = await tryHandleAppointmentSelection({
-    conversation,
-    inbound,
+    conversation: context.conversation,
+    inbound: context.inbound,
   });
   if (appointmentSelectionResult) {
-    await sendAndStoreOutboundReply({
-      conversationId: conversation.id,
-      provider: inbound.provider,
-      fromPhone: inbound.toPhone,
-      toPhone: inbound.fromPhone,
-      body: appointmentSelectionResult.reply,
+    return buildLifecycleReply({
+      reply: appointmentSelectionResult.reply,
+      nextAction: appointmentSelectionResult.next_action,
+      generatedBy: "sms_concierge_appointment_selection",
       rawPayload: {
-        generated_by: "sms_concierge_appointment_selection",
-        next_action: appointmentSelectionResult.next_action,
         selected_appointment: appointmentSelectionResult.selected_appointment || null,
         manage_url: appointmentSelectionResult.manage_url || null,
       },
-      ai: {
-        next_action: appointmentSelectionResult.next_action,
-      },
       internalNotes: "Client selected an appointment from the lookup list and was sent the manage link.",
-    });
-
-    return buildSuccessResponse({
-      ok: true,
-      conversation_id: conversation.id,
-      reply: appointmentSelectionResult.reply,
-      next_action: appointmentSelectionResult.next_action,
-      selected_appointment: appointmentSelectionResult.selected_appointment || null,
-      manage_url: appointmentSelectionResult.manage_url || null,
+      responseBody: {
+        selected_appointment: appointmentSelectionResult.selected_appointment || null,
+        manage_url: appointmentSelectionResult.manage_url || null,
+      },
     });
   }
 
   const numericClarificationResult = await tryHandleNumericClarificationReply({
-    conversation,
-    inbound,
-    recentMessages,
+    conversation: context.conversation,
+    inbound: context.inbound,
+    recentMessages: context.recentMessages,
   });
   if (numericClarificationResult) {
-    await sendAndStoreOutboundReply({
-      conversationId: conversation.id,
-      provider: inbound.provider,
-      fromPhone: inbound.toPhone,
-      toPhone: inbound.fromPhone,
-      body: numericClarificationResult.reply,
-      rawPayload: {
-        generated_by: "sms_concierge_numeric_clarification_guard",
-        next_action: numericClarificationResult.next_action,
-      },
-      ai: {
-        next_action: numericClarificationResult.next_action,
-      },
-      internalNotes: "Ignored numeric-only reply because there was no active numbered choice to select.",
-    });
-
-    return buildSuccessResponse({
-      ok: true,
-      conversation_id: conversation.id,
+    return buildLifecycleReply({
       reply: numericClarificationResult.reply,
-      next_action: numericClarificationResult.next_action,
+      nextAction: numericClarificationResult.next_action,
+      generatedBy: "sms_concierge_numeric_clarification_guard",
+      internalNotes: "Ignored numeric-only reply because there was no active numbered choice to select.",
     });
   }
 
   const noAvailabilitySelectionResult = await tryHandleNoAvailabilitySelection({
-    conversation,
-    inbound,
-    recentMessages,
+    conversation: context.conversation,
+    inbound: context.inbound,
+    recentMessages: context.recentMessages,
   });
   if (noAvailabilitySelectionResult) {
-    await sendAndStoreOutboundReply({
-      conversationId: conversation.id,
-      provider: inbound.provider,
-      fromPhone: inbound.toPhone,
-      toPhone: inbound.fromPhone,
-      body: noAvailabilitySelectionResult.reply,
+    return buildLifecycleReply({
+      reply: noAvailabilitySelectionResult.reply,
+      nextAction: noAvailabilitySelectionResult.next_action,
+      generatedBy: "sms_concierge_no_availability_selection",
       rawPayload: {
-        generated_by: "sms_concierge_no_availability_selection",
-        next_action: noAvailabilitySelectionResult.next_action,
         offered_slots: noAvailabilitySelectionResult.offered_slots || [],
-      },
-      ai: {
-        next_action: noAvailabilitySelectionResult.next_action,
       },
       internalNotes: "Handled a no-availability follow-up selection and returned the next fallback path.",
       offeredSlots: noAvailabilitySelectionResult.offered_slots || [],
-    });
-
-    return buildSuccessResponse({
-      ok: true,
-      conversation_id: conversation.id,
-      reply: noAvailabilitySelectionResult.reply,
-      next_action: noAvailabilitySelectionResult.next_action,
-      offered_slots: noAvailabilitySelectionResult.offered_slots || [],
+      responseBody: {
+        offered_slots: noAvailabilitySelectionResult.offered_slots || [],
+      },
     });
   }
 
   const bookingActionResult = await tryHandleBookingAction({
-    conversation,
-    inbound,
-    recentMessages,
+    conversation: context.conversation,
+    inbound: context.inbound,
+    recentMessages: context.recentMessages,
   });
   if (bookingActionResult) {
-    await sendAndStoreOutboundReply({
-      conversationId: conversation.id,
-      provider: inbound.provider,
-      fromPhone: inbound.toPhone,
-      toPhone: inbound.fromPhone,
-      body: bookingActionResult.reply,
+    return buildLifecycleReply({
+      reply: bookingActionResult.reply,
+      nextAction: bookingActionResult.next_action,
+      generatedBy: "sms_concierge_booking_action",
       rawPayload: {
-        generated_by: "sms_concierge_booking_action",
-        next_action: bookingActionResult.next_action,
         offered_slots: bookingActionResult.offered_slots || [],
-      },
-      ai: {
-        next_action: bookingActionResult.next_action,
       },
       internalNotes: "Handled a booking follow-up with the lightweight booking action classifier.",
       offeredSlots: bookingActionResult.offered_slots || [],
-    });
-
-    return buildSuccessResponse({
-      ok: true,
-      conversation_id: conversation.id,
-      reply: bookingActionResult.reply,
-      next_action: bookingActionResult.next_action,
-      offered_slots: bookingActionResult.offered_slots || [],
+      responseBody: {
+        offered_slots: bookingActionResult.offered_slots || [],
+      },
     });
   }
 
   const availabilityMetaQuestionResult = await tryHandleAvailabilityMetaQuestion({
-    conversation,
-    inbound,
+    conversation: context.conversation,
+    inbound: context.inbound,
   });
   if (availabilityMetaQuestionResult) {
-    await sendAndStoreOutboundReply({
-      conversationId: conversation.id,
-      provider: inbound.provider,
-      fromPhone: inbound.toPhone,
-      toPhone: inbound.fromPhone,
-      body: availabilityMetaQuestionResult.reply,
+    return buildLifecycleReply({
+      reply: availabilityMetaQuestionResult.reply,
+      nextAction: availabilityMetaQuestionResult.next_action,
+      generatedBy: "sms_concierge_availability_meta_question",
       rawPayload: {
-        generated_by: "sms_concierge_availability_meta_question",
-        next_action: availabilityMetaQuestionResult.next_action,
         offered_slots: availabilityMetaQuestionResult.offered_slots || [],
-      },
-      ai: {
-        next_action: availabilityMetaQuestionResult.next_action,
       },
       internalNotes: "Answered a meta availability question from the currently offered slots.",
       offeredSlots: availabilityMetaQuestionResult.offered_slots || [],
-    });
-
-    return buildSuccessResponse({
-      ok: true,
-      conversation_id: conversation.id,
-      reply: availabilityMetaQuestionResult.reply,
-      next_action: availabilityMetaQuestionResult.next_action,
-      offered_slots: availabilityMetaQuestionResult.offered_slots || [],
+      responseBody: {
+        offered_slots: availabilityMetaQuestionResult.offered_slots || [],
+      },
     });
   }
 
-  const interpretation = await interpretIncomingMessage({
-    conversation,
-    inbound,
-    recentMessages,
+  return null;
+}
+
+async function runInterpretationPhase(context: InboundLifecycleContext) {
+  return await interpretIncomingMessage({
+    conversation: context.conversation,
+    inbound: context.inbound,
+    recentMessages: context.recentMessages,
   });
+}
 
-  await updateConversationInterpretation(conversation.id, interpretation);
+async function runStatePhase(context: InboundLifecycleContext, interpretation: InterpreterOutput) {
+  await updateConversationInterpretation(context.conversation.id, interpretation);
+}
 
-  await sendAndStoreOutboundReply({
-    conversationId: conversation.id,
-    provider: inbound.provider,
-    fromPhone: inbound.toPhone,
-    toPhone: inbound.fromPhone,
-    body: interpretation.clientFacingReply,
+async function runResponsePhase(
+  context: InboundLifecycleContext,
+  reply: InboundLifecycleReply,
+) {
+  return await respondToInboundLifecycle(context, reply);
+}
+
+function buildInterpretationLifecycleReply(interpretation: InterpreterOutput): InboundLifecycleReply {
+  return buildLifecycleReply({
+    reply: interpretation.clientFacingReply,
+    nextAction: interpretation.nextAction,
+    generatedBy: "sms_concierge_ai",
     rawPayload: {
-      generated_by: "sms_concierge_ai",
-      next_action: interpretation.nextAction,
       structured_state: interpretation.updatedState,
     },
     ai: {
       internal_notes: interpretation.internalNotes,
-      next_action: interpretation.nextAction,
     },
     stateSnapshot: interpretation.updatedState,
     bookingRequest: interpretation.bookingRequest,
     internalNotes: interpretation.internalNotes,
     offeredSlots: interpretation.offeredSlots || [],
+    responseBody: {
+      updated_state: interpretation.updatedState,
+      booking_request: interpretation.bookingRequest,
+      offered_slots: interpretation.offeredSlots || [],
+      internal_notes: interpretation.internalNotes,
+    },
   });
+}
 
-  return buildSuccessResponse({
-    ok: true,
-    conversation_id: conversation.id,
-    reply: interpretation.clientFacingReply,
-    next_action: interpretation.nextAction,
-    updated_state: interpretation.updatedState,
-    booking_request: interpretation.bookingRequest,
-    offered_slots: interpretation.offeredSlots || [],
-    internal_notes: interpretation.internalNotes,
-  });
+async function handleInboundWebhook(body: JsonRecord) {
+  const inputPhase = await runInputPhase(body);
+  if (inputPhase.response) {
+    return inputPhase.response;
+  }
+
+  const context = inputPhase.context!;
+  const decision = runDecisionPhase(context);
+
+  if (decision.kind === "reset") {
+    return await runResponsePhase(context, buildResetLifecycleReply());
+  }
+
+  if (decision.kind === "short_circuit_action") {
+    const actionPhaseReply = await runActionPhase(context);
+    if (actionPhaseReply) {
+      return await runResponsePhase(context, actionPhaseReply);
+    }
+  }
+
+  const interpretation = await runInterpretationPhase(context);
+  await runStatePhase(context, interpretation);
+  return await runResponsePhase(context, buildInterpretationLifecycleReply(interpretation));
 }
 
 async function handleSimulateConversation(body: JsonRecord) {
@@ -8201,13 +8917,31 @@ async function handleSimulateConversation(body: JsonRecord) {
         stateBefore,
         stateAfter,
         bookingRequestAfter,
+        latestMessage: messages[index],
+        reply: normalizeString(payload.reply),
+        nextAction: normalizeString(payload.next_action),
       })
       : [];
+    const lifecycle = includeDebugTrace
+      ? buildLifecycleTrace({
+        message: messages[index],
+        provider,
+        fromPhone,
+        toPhone,
+        detectedAction,
+        stateBefore,
+        stateAfter,
+        nextAction: payload.next_action,
+        reply: normalizeString(payload.reply),
+        internalNotes: normalizeString(payload.internal_notes),
+      })
+      : null;
     results.push({
       inbound: messages[index],
       detected_action: includeDebugTrace ? detectedAction : null,
       state_before: includeDebugTrace ? stateBefore : null,
       state_after: includeDebugTrace ? stateAfter : null,
+      lifecycle,
       reply: normalizeString(payload.reply),
       expected_reply: normalizeString(payload.reply),
       next_action: payload.next_action,

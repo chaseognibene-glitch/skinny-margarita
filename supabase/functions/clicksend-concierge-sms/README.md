@@ -50,6 +50,19 @@ Required GitHub repository secrets:
   Create a personal access token in Supabase, then add it in GitHub under `Settings -> Secrets and variables -> Actions -> New repository secret`.
 - `SUPABASE_PROJECT_ID`
   Add your Supabase project reference as a repository secret in the same GitHub Actions secrets screen.
+- `SUPABASE_URL`
+  The Supabase project URL used by the local regression harness in GitHub Actions.
+- `SUPABASE_SERVICE_ROLE_KEY`
+  The service role key used by the local regression harness and booking proxy calls in GitHub Actions.
+- `OPENAI_API_KEY`
+  Required so the local regression harness can exercise the real booking interpreter before deployment.
+
+Optional GitHub repository secrets for the regression harness:
+
+- `OPENAI_MODEL`
+- `OPENAI_URL`
+- `BOULEVARD_BOOKING_PROXY_URL`
+- `BOULEVARD_LOCATION_ID`
 
 Do not commit tokens, project refs, or any other credentials into this repository.
 
@@ -65,6 +78,7 @@ Files:
 - [.env.local](/Users/chaseognibene/Documents/Playground/.env.local)
 - [local-sim-lib.mjs](/Users/chaseognibene/Documents/Playground/supabase/functions/clicksend-concierge-sms/scripts/local-sim-lib.mjs)
 - [sim-one.mjs](/Users/chaseognibene/Documents/Playground/supabase/functions/clicksend-concierge-sms/scripts/sim-one.mjs)
+- [test-booking.mjs](/Users/chaseognibene/Documents/Playground/supabase/functions/clicksend-concierge-sms/scripts/test-booking.mjs)
 - [sim-touchup.mjs](/Users/chaseognibene/Documents/Playground/supabase/functions/clicksend-concierge-sms/scripts/sim-touchup.mjs)
 - [sim-regression10.mjs](/Users/chaseognibene/Documents/Playground/supabase/functions/clicksend-concierge-sms/scripts/sim-regression10.mjs)
 
@@ -78,9 +92,12 @@ Then run:
 
 ```bash
 npm run sim:one
+npm run test:booking
 npm run sim:touchup
 npm run sim:regression10
 ```
+
+`test:booking` is the first locked booking regression suite. It exercises service interpretation, service removal, timing pivots, ambiguity cleanup, stylist preference resolution, and appointment-management classification. The GitHub Actions deploy workflow now runs this suite before deploying `clicksend-concierge-sms`, and any regression failure blocks deployment.
 
 `sim:touchup` posts this exact payload:
 

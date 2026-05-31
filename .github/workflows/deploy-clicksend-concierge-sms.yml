@@ -13,10 +13,51 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Set up Supabase CLI
         uses: supabase/setup-cli@v1
         with:
           version: latest
+
+      - name: Write booking regression env file
+        run: |
+          cat <<'EOF' > .env.ci
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          PROJECT_SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          PROJECT_SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
+          OPENAI_URL=${{ secrets.OPENAI_URL }}
+          BOULEVARD_BOOKING_PROXY_URL=${{ secrets.BOULEVARD_BOOKING_PROXY_URL }}
+          BOULEVARD_LOCATION_ID=${{ secrets.BOULEVARD_LOCATION_ID }}
+          LOCAL_SIM_ENDPOINT=http://127.0.0.1:54321/functions/v1/clicksend-concierge-sms
+          EOF
+
+      - name: Start local SMS concierge for regression tests
+        run: |
+          nohup supabase functions serve clicksend-concierge-sms --env-file .env.ci --no-verify-jwt > /tmp/clicksend-concierge-sms.log 2>&1 &
+
+      - name: Wait for local SMS concierge endpoint
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl -fsS -X POST http://127.0.0.1:54321/functions/v1/clicksend-concierge-sms \
+              -H 'Content-Type: application/json' \
+              -d '{"action":"simulate-conversation","provider":"simulation","from":"+16318348150","messages":["ping"],"debug":true}' >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Local SMS concierge endpoint did not become ready in time."
+          cat /tmp/clicksend-concierge-sms.log || true
+          exit 1
+
+      - name: Run booking regression suite
+        run: npm run test:booking
 
       - name: Deploy Edge Function
         working-directory: ./supabase

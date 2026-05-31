@@ -50,13 +50,10 @@ export async function ensureEndpointIsReachable(endpoint = localEndpoint()) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        action: "simulate-conversation",
-        provider: "simulation",
-        from: DEFAULT_FROM,
-        messages: ["ping"],
-        debug: true,
+        action: "get-conversation",
+        phone: DEFAULT_FROM,
       }),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(15000),
     });
 
     return { ok: true, status: response.status };
@@ -100,13 +97,49 @@ export async function runSimulation({ messages, from = DEFAULT_FROM, endpoint = 
   return { response, json, payload };
 }
 
+export async function simulateConversation({ messages, from = DEFAULT_FROM, endpoint = localEndpoint(), extraPayload = {} }) {
+  const result = await runSimulation({ messages, from, endpoint, extraPayload });
+  const rawTurns = Array.isArray(result?.json?.results) ? result.json.results : [];
+  const turns = rawTurns.map((turn) => ({
+    input: turn?.inbound ?? null,
+    interpretation: turn?.lifecycle?.interpretation ?? {
+      detectedAction: turn?.detected_action ?? null,
+      internalNotes: turn?.internal_notes ?? null,
+    },
+    oldState: turn?.state_before ?? null,
+    newState: turn?.state_after ?? null,
+    decision: turn?.lifecycle?.decision ?? {
+      nextAction: turn?.next_action ?? null,
+      blockers: [],
+      readyToSearchAvailability: turn?.state_after?.ready_to_search_availability ?? false,
+      readyToBook: turn?.state_after?.ready_to_book ?? false,
+      needsServiceDecision: turn?.state_after?.needs_service_decision ?? false,
+      decisionQuestionKey: turn?.state_after?.decision_question_key ?? null,
+    },
+    reply: turn?.reply ?? null,
+    raw: turn,
+  }));
+
+  return {
+    response: result.response,
+    payload: result.payload,
+    raw: result.json,
+    turns,
+    finalState: result?.json?.final_state ?? result?.json?.conversation?.state ?? result?.json?.updated_state ?? null,
+  };
+}
+
 function formatList(value) {
   if (!Array.isArray(value) || value.length === 0) return "[]";
   return JSON.stringify(value);
 }
 
 export function printTurnTrace(result) {
-  const turns = Array.isArray(result?.json?.turns) ? result.json.turns : [];
+  const turns = Array.isArray(result?.json?.turns)
+    ? result.json.turns
+    : Array.isArray(result?.json?.results)
+    ? result.json.results
+    : [];
   const httpStatus = result?.response?.status ?? "n/a";
   const okValue = result?.json?.ok ?? false;
   const errorValue = result?.json?.error ?? null;

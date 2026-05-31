@@ -1,0 +1,13 @@
+{
+  "name": "playground-local-sims",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "serve:clicksend-local": "supabase functions serve clicksend-concierge-sms --env-file .env.local --no-verify-jwt",
+    "sim:one": "node ./supabase/functions/clicksend-concierge-sms/scripts/sim-one.mjs",
+    "sim:root-touchup-timing-pivot": "node ./supabase/functions/clicksend-concierge-sms/scripts/sim-root-touchup-timing-pivot.mjs",
+    "sim:touchup": "node ./supabase/functions/clicksend-concierge-sms/scripts/sim-touchup.mjs",
+    "sim:regression10": "node ./supabase/functions/clicksend-concierge-sms/scripts/sim-regression10.mjs",
+    "test:booking": "node ./supabase/functions/clicksend-concierge-sms/scripts/test-booking.mjs"
+  }
+}
